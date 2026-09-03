@@ -19,7 +19,8 @@ st.title("📊 F&O Open Interest")
 NSE_HOME = "https://www.nseindia.com"
 NSE_OPTION_CHAIN_PAGE = "https://www.nseindia.com/option-chain"
 NSE_UNDERLYING_API = "https://www.nseindia.com/api/underlying-information"
-NSE_OPTION_CHAIN_API = "https://www.nseindia.com/api/option-chain-equities"
+NSE_CONTRACT_INFO_API = "https://www.nseindia.com/api/option-chain-contract-info"
+NSE_OPTION_CHAIN_API = "https://www.nseindia.com/api/option-chain-v3"
 
 HEADERS = {
     "User-Agent": (
@@ -31,11 +32,15 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": NSE_OPTION_CHAIN_PAGE,
     "Connection": "keep-alive",
+    "X-Requested-With": "XMLHttpRequest",
 }
 
 
 def create_nse_session():
-    session = requests.Session()
+    try:
+        session = requests.Session(impersonate="chrome")
+    except TypeError:
+        session = requests.Session()
     session.headers.update(HEADERS)
     session.get(NSE_HOME, timeout=15)
     time.sleep(0.5)
@@ -84,45 +89,86 @@ def get_fno_stocks():
 
 
 def get_option_chain(symbol):
+    """Fetch nearest-expiry stock option-chain using NSE's current v3 API."""
     last_error = None
+
     for attempt in range(4):
         try:
             session = create_nse_session()
-            response = session.get(
-                NSE_OPTION_CHAIN_API,
-                params={"symbol": symbol},
-                timeout=30
-            )
-            response.raise_for_status()
-            try:
-                data = response.json()
-            except Exception:
-                raise RuntimeError("NSE returned a non-JSON response.")
 
-            records = data.get("records", {})
-            option_data = records.get("data", [])
-            if not option_data:
+            # NSE changed the option-chain API to v3. The nearest expiry
+            # is obtained first from the contract-info endpoint.
+            info = session.get(
+                NSE_CONTRACT_INFO_API,
+                params={"symbol": symbol},
+                timeout=25
+            )
+            info.raise_for_status()
+
+            try:
+                info_payload = info.json()
+            except Exception:
                 raise RuntimeError(
-                    f"NSE returned no option-chain records for {symbol}."
+                    "NSE returned a non-JSON contract-info response."
                 )
 
-            expiry_dates = records.get("expiryDates", [])
+            expiry_dates = (
+                info_payload.get("expiryDates")
+                or info_payload.get("records", {}).get("expiryDates", [])
+            )
+
             if not expiry_dates:
                 raise RuntimeError(
                     f"NSE returned no expiry dates for {symbol}."
                 )
 
             nearest_expiry = expiry_dates[0]
-            rows = []
-            for item in option_data:
+
+            response = session.get(
+                NSE_OPTION_CHAIN_API,
+                params={
+                    "type": "Equity",
+                    "symbol": symbol,
+                    "expiry": nearest_expiry,
+                },
+                timeout=30
+            )
+            response.raise_for_status()
+
+            try:
+                payload = response.json()
+            except Exception:
+                raise RuntimeError(
+                    "NSE returned a non-JSON option-chain response."
+                )
+
+            records = payload.get("records", {})
+            rows = records.get("data", [])
+
+            # v3 responses can expose data directly under data.
+            if not rows:
+                rows = payload.get("data", [])
+
+            if not rows:
+                raise RuntimeError(
+                    f"NSE returned no option-chain records for {symbol} "
+                    f"({nearest_expiry})."
+                )
+
+            parsed = []
+
+            for item in rows:
                 if item.get("expiryDate") != nearest_expiry:
                     continue
+
                 strike = item.get("strikePrice")
                 if strike is None:
                     continue
+
                 ce = item.get("CE") or {}
                 pe = item.get("PE") or {}
-                rows.append({
+
+                parsed.append({
                     "Strike": strike,
                     "CE OI": ce.get("openInterest", 0),
                     "CE Change OI": ce.get("changeinOpenInterest", 0),
@@ -130,17 +176,48 @@ def get_option_chain(symbol):
                     "PE Change OI": pe.get("changeinOpenInterest", 0),
                 })
 
-            df = pd.DataFrame(rows)
+            # Some v3 responses may use nested option-type fields.
+            if not parsed:
+                for item in rows:
+                    strike = item.get("strikePrice")
+                    if strike is None:
+                        continue
+                    ce = item.get("CE") or item.get("ce") or {}
+                    pe = item.get("PE") or item.get("pe") or {}
+                    parsed.append({
+                        "Strike": strike,
+                        "CE OI": ce.get("openInterest", 0),
+                        "CE Change OI": ce.get("changeinOpenInterest", 0),
+                        "PE OI": pe.get("openInterest", 0),
+                        "PE Change OI": pe.get("changeinOpenInterest", 0),
+                    })
+
+            df = pd.DataFrame(parsed)
             if df.empty:
                 raise RuntimeError(
-                    f"No option data available for nearest expiry {nearest_expiry}."
+                    f"No option contracts found for {symbol}."
                 )
 
-            for col in ["Strike", "CE OI", "CE Change OI", "PE OI", "PE Change OI"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+            for col in [
+                "Strike", "CE OI", "CE Change OI",
+                "PE OI", "PE Change OI"
+            ]:
+                df[col] = pd.to_numeric(
+                    df[col], errors="coerce"
+                ).fillna(0)
 
-            timestamp = records.get("timestamp") or data.get("timestamp") or ""
-            return df.sort_values("Strike").reset_index(drop=True), nearest_expiry, timestamp
+            timestamp = (
+                records.get("timestamp")
+                or payload.get("timestamp")
+                or info_payload.get("timestamp")
+                or ""
+            )
+
+            return (
+                df.sort_values("Strike").reset_index(drop=True),
+                nearest_expiry,
+                timestamp
+            )
 
         except Exception as exc:
             last_error = exc
