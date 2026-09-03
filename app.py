@@ -88,85 +88,70 @@ def get_fno_stocks():
     return stocks
 
 
-def get_option_chain(symbol):
-    """Fetch nearest-expiry stock option-chain using NSE's current v3 API."""
+def get_contract_info(session, symbol):
+    response = session.get(
+        NSE_CONTRACT_INFO_API,
+        params={"symbol": symbol},
+        timeout=25
+    )
+    response.raise_for_status()
+    payload = response.json()
+    expiry_dates = (
+        payload.get("expiryDates")
+        or payload.get("records", {}).get("expiryDates", [])
+    )
+    if not expiry_dates:
+        raise RuntimeError(f"NSE returned no expiry dates for {symbol}.")
+    return expiry_dates
+
+
+def get_option_chain(symbol, expiry):
     last_error = None
 
     for attempt in range(4):
         try:
             session = create_nse_session()
-
-            # NSE changed the option-chain API to v3. The nearest expiry
-            # is obtained first from the contract-info endpoint.
-            info = session.get(
-                NSE_CONTRACT_INFO_API,
-                params={"symbol": symbol},
-                timeout=25
-            )
-            info.raise_for_status()
-
-            try:
-                info_payload = info.json()
-            except Exception:
-                raise RuntimeError(
-                    "NSE returned a non-JSON contract-info response."
-                )
-
-            expiry_dates = (
-                info_payload.get("expiryDates")
-                or info_payload.get("records", {}).get("expiryDates", [])
-            )
-
-            if not expiry_dates:
-                raise RuntimeError(
-                    f"NSE returned no expiry dates for {symbol}."
-                )
-
-            nearest_expiry = expiry_dates[0]
-
             response = session.get(
                 NSE_OPTION_CHAIN_API,
                 params={
                     "type": "Equity",
                     "symbol": symbol,
-                    "expiry": nearest_expiry,
+                    "expiry": expiry,
                 },
                 timeout=30
             )
             response.raise_for_status()
-
-            try:
-                payload = response.json()
-            except Exception:
-                raise RuntimeError(
-                    "NSE returned a non-JSON option-chain response."
-                )
+            payload = response.json()
 
             records = payload.get("records", {})
-            rows = records.get("data", [])
-
-            # v3 responses can expose data directly under data.
-            if not rows:
-                rows = payload.get("data", [])
+            rows = records.get("data", []) or payload.get("data", [])
 
             if not rows:
                 raise RuntimeError(
-                    f"NSE returned no option-chain records for {symbol} "
-                    f"({nearest_expiry})."
+                    f"NSE returned no option-chain records for "
+                    f"{symbol} ({expiry})."
                 )
 
             parsed = []
+            underlying_price = None
 
             for item in rows:
-                if item.get("expiryDate") != nearest_expiry:
+                if item.get("expiryDate") not in (None, expiry):
                     continue
 
                 strike = item.get("strikePrice")
                 if strike is None:
                     continue
 
-                ce = item.get("CE") or {}
-                pe = item.get("PE") or {}
+                ce = item.get("CE") or item.get("ce") or {}
+                pe = item.get("PE") or item.get("pe") or {}
+
+                if underlying_price is None:
+                    underlying_price = (
+                        ce.get("underlyingValue")
+                        or pe.get("underlyingValue")
+                        or item.get("underlyingValue")
+                    )
 
                 parsed.append({
                     "Strike": strike,
@@ -176,47 +161,59 @@ def get_option_chain(symbol):
                     "PE Change OI": pe.get("changeinOpenInterest", 0),
                 })
 
-            # Some v3 responses may use nested option-type fields.
-            if not parsed:
-                for item in rows:
-                    strike = item.get("strikePrice")
-                    if strike is None:
-                        continue
-                    ce = item.get("CE") or item.get("ce") or {}
-                    pe = item.get("PE") or item.get("pe") or {}
-                    parsed.append({
-                        "Strike": strike,
-                        "CE OI": ce.get("openInterest", 0),
-                        "CE Change OI": ce.get("changeinOpenInterest", 0),
-                        "PE OI": pe.get("openInterest", 0),
-                        "PE Change OI": pe.get("changeinOpenInterest", 0),
-                    })
-
             df = pd.DataFrame(parsed)
+
             if df.empty:
                 raise RuntimeError(
-                    f"No option contracts found for {symbol}."
+                    f"No option contracts found for {symbol} ({expiry})."
                 )
 
             for col in [
                 "Strike", "CE OI", "CE Change OI",
                 "PE OI", "PE Change OI"
             ]:
-                df[col] = pd.to_numeric(
-                    df[col], errors="coerce"
-                ).fillna(0)
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+            previous_close = None
+            price_change_pct = None
+
+            # NSE equity quote gives the current underlying price and
+            # previous close; option-chain underlyingValue is the fallback.
+            try:
+                quote = session.get(
+                    "https://www.nseindia.com/api/quote-equity",
+                    params={"symbol": symbol},
+                    timeout=20
+                )
+                quote.raise_for_status()
+                q = quote.json()
+                pi = q.get("priceInfo", {})
+                last_price = pi.get("lastPrice")
+                previous_close = pi.get("previousClose")
+
+                if last_price is not None:
+                    underlying_price = float(last_price)
+
+                if last_price is not None and previous_close:
+                    price_change_pct = (
+                        (float(last_price) / float(previous_close) - 1) * 100
+                    )
+            except Exception:
+                pass
 
             timestamp = (
                 records.get("timestamp")
                 or payload.get("timestamp")
-                or info_payload.get("timestamp")
                 or ""
             )
 
             return (
                 df.sort_values("Strike").reset_index(drop=True),
-                nearest_expiry,
-                timestamp
+                expiry,
+                timestamp,
+                underlying_price,
+                previous_close,
+                price_change_pct
             )
 
         except Exception as exc:
@@ -335,28 +332,56 @@ if refresh:
     st.rerun()
 
 if not selected_symbol:
-    st.info("Type 1–2 letters in the search box and select a stock.")
+    st.info(
+        "Type 1–2 letters in the search box and select a stock."
+    )
     st.stop()
 
 
+# ============================================================
+# EXPIRY
+# ============================================================
+
+try:
+    expiry_dates = get_contract_info(
+        create_nse_session(),
+        selected_symbol
+    )
+except Exception as e:
+    st.error(f"Unable to load expiry dates: {e}")
+    st.stop()
+
+expiry = st.selectbox(
+    "Expiry",
+    options=expiry_dates,
+    index=0,
+    key=f"expiry_{selected_symbol}"
+)
+
 with st.spinner(
-    f"Fetching NSE option-chain data for {selected_symbol}..."
+    f"Fetching NSE option-chain data for "
+    f"{selected_symbol} ({expiry})..."
 ):
     try:
-        df, expiry, nse_timestamp = get_option_chain(
-            selected_symbol
-        )
+        (
+            df,
+            expiry,
+            nse_timestamp,
+            underlying_price,
+            previous_close,
+            price_change_pct
+        ) = get_option_chain(selected_symbol, expiry)
     except Exception as e:
-        st.error(f"Unable to fetch option-chain data: {e}")
+        st.error(f"Unable to fetch NSE option-chain data: {e}")
         st.info(
-            "NSE can occasionally reject requests temporarily. "
-            "Please press Refresh and try again."
+            "The app automatically retries NSE requests. "
+            "If NSE is temporarily unavailable, press Refresh."
         )
         st.stop()
 
 
 if nse_timestamp:
-    last_updated = nse_timestamp
+    last_updated = str(nse_timestamp)
 else:
     last_updated = datetime.now(
         ZoneInfo("Asia/Kolkata")
@@ -365,18 +390,81 @@ else:
 
 st.markdown(f"### {selected_symbol}")
 
-info1, info2, info3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 
-with info1:
-    st.metric("Nearest Expiry", expiry)
-
-with info2:
+with c1:
+    st.metric(
+        "Underlying Price",
+        f"₹{underlying_price:,.2f}" if underlying_price is not None else "N/A",
+        f"{price_change_pct:+.2f}%" if price_change_pct is not None else None
+    )
+with c2:
+    st.metric("Expiry", expiry)
+with c3:
     st.metric("Last Updated", last_updated)
-
-with info3:
+with c4:
     st.metric("Strikes Analysed", f"{len(df):,}")
 
 st.divider()
+
+# ============================================================
+# QUICK OI ANALYSIS
+# ============================================================
+
+total_ce_oi = float(df["CE OI"].sum())
+total_pe_oi = float(df["PE OI"].sum())
+pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else None
+
+pain = {}
+for settlement in df["Strike"]:
+    call_pain = (df["CE OI"] * (settlement - df["Strike"]).clip(lower=0)).sum()
+    put_pain = (df["PE OI"] * (df["Strike"] - settlement).clip(lower=0)).sum()
+    pain[settlement] = call_pain + put_pain
+
+max_pain = min(pain, key=pain.get) if pain else None
+ce_max = df.loc[df["CE OI"].idxmax(), "Strike"]
+pe_max = df.loc[df["PE OI"].idxmax(), "Strike"]
+
+st.subheader("🔎 Quick OI Analysis")
+
+m1, m2, m3, m4 = st.columns(4)
+with m1:
+    st.metric("PCR (OI)", f"{pcr:.2f}" if pcr is not None else "N/A")
+with m2:
+    st.metric("Max Pain", f"{max_pain:,.0f}" if max_pain is not None else "N/A")
+with m3:
+    st.metric("Highest CE OI", f"{ce_max:,.0f}")
+with m4:
+    st.metric("Highest PE OI", f"{pe_max:,.0f}")
+
+if underlying_price is not None:
+    ce_view = "Potential resistance" if ce_max > underlying_price else "At/below price"
+    pe_view = "Potential support" if pe_max < underlying_price else "At/above price"
+    st.caption(
+        f"Highest CE OI: {ce_max:,.0f} — {ce_view}  •  "
+        f"Highest PE OI: {pe_max:,.0f} — {pe_view}"
+    )
+
+ce_add = float(df["CE Change OI"].clip(lower=0).sum())
+pe_add = float(df["PE Change OI"].clip(lower=0).sum())
+ce_unwind = float((-df["CE Change OI"].clip(upper=0)).sum())
+pe_unwind = float((-df["PE Change OI"].clip(upper=0)).sum())
+
+if price_change_pct is not None:
+    if price_change_pct > 0.15 and ce_add > pe_add:
+        flow = "Price up + stronger CE OI addition → resistance-type option flow"
+    elif price_change_pct < -0.15 and pe_add > ce_add:
+        flow = "Price down + stronger PE OI addition → support-type option flow"
+    elif price_change_pct > 0.15 and ce_unwind > pe_unwind:
+        flow = "Price up + stronger CE unwinding → short-covering type flow"
+    elif price_change_pct < -0.15 and pe_unwind > ce_unwind:
+        flow = "Price down + stronger PE unwinding → long-unwinding type flow"
+    else:
+        flow = "Mixed option OI flow"
+else:
+    flow = "Price change unavailable — OI flow shown without price interpretation"
+
+st.info(flow)
 
 st.subheader("📈 Top 3 Highest Open Interest")
 
