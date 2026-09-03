@@ -450,21 +450,27 @@ pe_add = float(df["PE Change OI"].clip(lower=0).sum())
 ce_unwind = float((-df["CE Change OI"].clip(upper=0)).sum())
 pe_unwind = float((-df["PE Change OI"].clip(upper=0)).sum())
 
-if price_change_pct is not None:
-    if price_change_pct > 0.15 and ce_add > pe_add:
-        flow = "Price up + stronger CE OI addition → resistance-type option flow"
-    elif price_change_pct < -0.15 and pe_add > ce_add:
-        flow = "Price down + stronger PE OI addition → support-type option flow"
-    elif price_change_pct > 0.15 and ce_unwind > pe_unwind:
-        flow = "Price up + stronger CE unwinding → short-covering type flow"
-    elif price_change_pct < -0.15 and pe_unwind > ce_unwind:
-        flow = "Price down + stronger PE unwinding → long-unwinding type flow"
-    else:
-        flow = "Mixed option OI flow"
-else:
-    flow = "Price change unavailable — OI flow shown without price interpretation"
+# Simple price + total OI interpretation
+total_oi_change = float(df["CE Change OI"].sum() + df["PE Change OI"].sum())
 
-st.info(flow)
+if price_change_pct is not None and price_change_pct > 0 and total_oi_change > 0:
+    interpretation = "🟢 Long Buildup"
+elif price_change_pct is not None and price_change_pct < 0 and total_oi_change > 0:
+    interpretation = "🔴 Short Buildup"
+elif price_change_pct is not None and price_change_pct > 0 and total_oi_change < 0:
+    interpretation = "🔵 Short Covering"
+elif price_change_pct is not None and price_change_pct < 0 and total_oi_change < 0:
+    interpretation = "🟠 Long Unwinding"
+else:
+    interpretation = "🟡 Neutral"
+
+st.subheader("🔎 OI Interpretation")
+st.info(
+    f"{interpretation}  •  Price: {price_change_pct:+.2f}%  •  "
+    f"OI: {total_oi_change:+,.0f}"
+    if price_change_pct is not None
+    else f"{interpretation}  •  OI: {total_oi_change:+,.0f}"
+)
 
 st.subheader("📈 Top 3 Highest Open Interest")
 
