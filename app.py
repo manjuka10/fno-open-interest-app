@@ -177,72 +177,141 @@ def get_option_chain(symbol, expiry):
             previous_close = None
             price_change_pct = None
 
-            # NSE equity quote gives the current underlying price and
-            # previous close; option-chain underlyingValue is the fallback.
+            # Do NOT depend on NSE's quote-equity pChange.
+            # Use NSE historical security data to obtain the latest
+            # previous-close, then calculate today's price change from
+            # the underlyingValue already present in the option chain.
             try:
-                quote = session.get(
-                    "https://www.nseindia.com/api/quote-equity",
-                    params={"symbol": symbol},
-                    timeout=20
+                from datetime import date, timedelta
+
+                today = date.today()
+                from_date = today - timedelta(days=7)
+
+                hist_headers = {
+                    "Referer": (
+                        "https://www.nseindia.com/get-quotes/equity"
+                        f"?symbol={symbol}"
+                    ),
+                    "Accept": "application/json,text/plain,*/*",
+                    "X-Requested-With": "XMLHttpRequest",
+                }
+                session.headers.update(hist_headers)
+
+                hist_response = session.get(
+                    "https://www.nseindia.com/api/historicalOR/"
+                    "generateSecurityWiseHistoricalData",
+                    params={
+                        "symbol": symbol,
+                        "from": from_date.strftime("%d-%m-%Y"),
+                        "to": today.strftime("%d-%m-%Y"),
+                        "series": "EQ",
+                        "type": "priceVolumeDeliverable",
+                        "csv": "false",
+                    },
+                    timeout=25
                 )
-                quote.raise_for_status()
-                q = quote.json()
-                pi = q.get("priceInfo", {})
-                last_price = pi.get("lastPrice")
-                previous_close = pi.get("previousClose")
+                hist_response.raise_for_status()
+                hist_payload = hist_response.json()
 
-                if last_price is not None:
-                    underlying_price = float(last_price)
+                hist_rows = (
+                    hist_payload.get("data")
+                    if isinstance(hist_payload, dict)
+                    else hist_payload
+                ) or []
 
-                # Prefer NSE's own percentage change when available.
-                nse_pchange = pi.get("pChange")
-                if nse_pchange is not None:
-                    price_change_pct = float(nse_pchange)
-                elif last_price is not None and previous_close:
-                    price_change_pct = (
-                        (float(last_price) / float(previous_close) - 1) * 100
+                # Use the latest row's previous-close value. This works
+                # both during market hours and after the session closes.
+                if hist_rows:
+                    def row_date(row):
+                        value = (
+                            row.get("CH_TIMESTAMP")
+                            or row.get("mTIMESTAMP")
+                            or row.get("date")
+                            or row.get("Date")
+                            or ""
+                        )
+                        try:
+                            return pd.to_datetime(value, dayfirst=True)
+                        except Exception:
+                            return pd.Timestamp.min
+
+                    hist_rows = sorted(hist_rows, key=row_date)
+                    latest_row = hist_rows[-1]
+
+                    prev_value = (
+                        latest_row.get("CH_PREV_CLS_PRICE")
+                        or latest_row.get("chPreviousClsPrice")
+                        or latest_row.get("Prev Close")
+                        or latest_row.get("prevClose")
                     )
+
+                    if prev_value is not None:
+                        previous_close = float(
+                            str(prev_value).replace(",", "")
+                        )
+
+                if (
+                    underlying_price is not None
+                    and previous_close is not None
+                    and previous_close > 0
+                ):
+                    price_change_pct = (
+                        (float(underlying_price) / previous_close - 1) * 100
+                    )
+
             except Exception:
                 pass
 
-            # Retry the NSE equity quote once with a fresh session and the
-            # stock quote page as Referer. This helps when NSE rejects the
-            # first quote request even though the option chain succeeds.
+            # Second NSE historical endpoint fallback.
             if price_change_pct is None:
                 try:
-                    retry_session = create_nse_session()
-                    retry_session.headers.update({
-                        "Referer": (
-                            "https://www.nseindia.com/get-quotes/equity"
-                            f"?symbol={symbol}"
-                        ),
-                        "Accept": "application/json,text/plain,*/*",
-                        "X-Requested-With": "XMLHttpRequest",
-                    })
-                    retry_quote = retry_session.get(
-                        "https://www.nseindia.com/api/quote-equity",
-                        params={"symbol": symbol},
-                        timeout=20
+                    from datetime import date, timedelta
+
+                    today = date.today()
+                    from_date = today - timedelta(days=7)
+
+                    fallback_response = session.get(
+                        "https://www.nseindia.com/api/historical/securityArchives",
+                        params={
+                            "symbol": symbol,
+                            "from": from_date.strftime("%d-%m-%Y"),
+                            "to": today.strftime("%d-%m-%Y"),
+                            "series": "EQ",
+                        },
+                        timeout=25
                     )
-                    retry_quote.raise_for_status()
-                    rq = retry_quote.json()
-                    rpi = rq.get("priceInfo") or {}
+                    fallback_response.raise_for_status()
+                    fallback_payload = fallback_response.json()
 
-                    r_last = rpi.get("lastPrice")
-                    r_prev = rpi.get("previousClose")
-                    r_pchange = rpi.get("pChange")
+                    rows = (
+                        fallback_payload.get("data", [])
+                        if isinstance(fallback_payload, dict)
+                        else []
+                    )
 
-                    if r_last is not None:
-                        underlying_price = float(r_last)
-                    if r_prev is not None:
-                        previous_close = float(r_prev)
-
-                    if r_pchange is not None:
-                        price_change_pct = float(r_pchange)
-                    elif r_last is not None and r_prev:
-                        price_change_pct = (
-                            (float(r_last) / float(r_prev) - 1) * 100
+                    if rows:
+                        latest = rows[-1]
+                        prev_value = (
+                            latest.get("CH_PREV_CLS_PRICE")
+                            or latest.get("chPreviousClsPrice")
+                            or latest.get("Prev Close")
+                            or latest.get("prevClose")
                         )
+
+                        if prev_value is not None:
+                            previous_close = float(
+                                str(prev_value).replace(",", "")
+                            )
+
+                        if (
+                            underlying_price is not None
+                            and previous_close is not None
+                            and previous_close > 0
+                        ):
+                            price_change_pct = (
+                                (float(underlying_price) / previous_close - 1)
+                                * 100
+                            )
                 except Exception:
                     pass
 
