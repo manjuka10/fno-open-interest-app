@@ -205,6 +205,47 @@ def get_option_chain(symbol, expiry):
             except Exception:
                 pass
 
+            # Retry the NSE equity quote once with a fresh session and the
+            # stock quote page as Referer. This helps when NSE rejects the
+            # first quote request even though the option chain succeeds.
+            if price_change_pct is None:
+                try:
+                    retry_session = create_nse_session()
+                    retry_session.headers.update({
+                        "Referer": (
+                            "https://www.nseindia.com/get-quotes/equity"
+                            f"?symbol={symbol}"
+                        ),
+                        "Accept": "application/json,text/plain,*/*",
+                        "X-Requested-With": "XMLHttpRequest",
+                    })
+                    retry_quote = retry_session.get(
+                        "https://www.nseindia.com/api/quote-equity",
+                        params={"symbol": symbol},
+                        timeout=20
+                    )
+                    retry_quote.raise_for_status()
+                    rq = retry_quote.json()
+                    rpi = rq.get("priceInfo") or {}
+
+                    r_last = rpi.get("lastPrice")
+                    r_prev = rpi.get("previousClose")
+                    r_pchange = rpi.get("pChange")
+
+                    if r_last is not None:
+                        underlying_price = float(r_last)
+                    if r_prev is not None:
+                        previous_close = float(r_prev)
+
+                    if r_pchange is not None:
+                        price_change_pct = float(r_pchange)
+                    elif r_last is not None and r_prev:
+                        price_change_pct = (
+                            (float(r_last) / float(r_prev) - 1) * 100
+                        )
+                except Exception:
+                    pass
+
             timestamp = (
                 records.get("timestamp")
                 or payload.get("timestamp")
@@ -466,7 +507,7 @@ elif price_change_pct is not None and price_change_pct > 0 and total_oi_change <
 elif price_change_pct is not None and price_change_pct < 0 and total_oi_change < 0:
     interpretation = "🟠 Long Unwinding"
 else:
-    interpretation = "🟡 Neutral"
+    interpretation = "⚪ No Clear Setup"
 
 st.subheader("🔎 OI Interpretation")
 if price_change_pct is not None:
@@ -476,7 +517,7 @@ if price_change_pct is not None:
     )
 else:
     st.warning(
-        f"Price change unavailable from NSE  •  OI: {total_oi_change:+,.0f}"
+        "Price change unavailable from NSE — OI interpretation cannot be classified."
     )
 
 st.subheader("📈 Top 3 Highest Open Interest")
