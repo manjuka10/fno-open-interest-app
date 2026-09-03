@@ -1,6 +1,9 @@
 import streamlit as st
 import pandas as pd
-import requests
+try:
+    from curl_cffi import requests
+except ImportError:
+    import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import time
@@ -81,84 +84,71 @@ def get_fno_stocks():
 
 
 def get_option_chain(symbol):
-    session = create_nse_session()
+    last_error = None
+    for attempt in range(4):
+        try:
+            session = create_nse_session()
+            response = session.get(
+                NSE_OPTION_CHAIN_API,
+                params={"symbol": symbol},
+                timeout=30
+            )
+            response.raise_for_status()
+            try:
+                data = response.json()
+            except Exception:
+                raise RuntimeError("NSE returned a non-JSON response.")
 
-    response = session.get(
-        NSE_OPTION_CHAIN_API,
-        params={"symbol": symbol},
-        timeout=20
-    )
-    response.raise_for_status()
+            records = data.get("records", {})
+            option_data = records.get("data", [])
+            if not option_data:
+                raise RuntimeError(
+                    f"NSE returned no option-chain records for {symbol}."
+                )
 
-    data = response.json()
-    records = data.get("records", {})
-    option_data = records.get("data", [])
+            expiry_dates = records.get("expiryDates", [])
+            if not expiry_dates:
+                raise RuntimeError(
+                    f"NSE returned no expiry dates for {symbol}."
+                )
 
-    if not option_data:
-        raise RuntimeError(
-            f"No option-chain data returned by NSE for {symbol}."
-        )
+            nearest_expiry = expiry_dates[0]
+            rows = []
+            for item in option_data:
+                if item.get("expiryDate") != nearest_expiry:
+                    continue
+                strike = item.get("strikePrice")
+                if strike is None:
+                    continue
+                ce = item.get("CE") or {}
+                pe = item.get("PE") or {}
+                rows.append({
+                    "Strike": strike,
+                    "CE OI": ce.get("openInterest", 0),
+                    "CE Change OI": ce.get("changeinOpenInterest", 0),
+                    "PE OI": pe.get("openInterest", 0),
+                    "PE Change OI": pe.get("changeinOpenInterest", 0),
+                })
 
-    nse_timestamp = (
-        records.get("timestamp")
-        or data.get("timestamp")
-        or ""
-    )
+            df = pd.DataFrame(rows)
+            if df.empty:
+                raise RuntimeError(
+                    f"No option data available for nearest expiry {nearest_expiry}."
+                )
 
-    expiry_dates = records.get("expiryDates", [])
+            for col in ["Strike", "CE OI", "CE Change OI", "PE OI", "PE Change OI"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    if not expiry_dates:
-        raise RuntimeError(
-            f"No expiry information returned by NSE for {symbol}."
-        )
+            timestamp = records.get("timestamp") or data.get("timestamp") or ""
+            return df.sort_values("Strike").reset_index(drop=True), nearest_expiry, timestamp
 
-    nearest_expiry = expiry_dates[0]
-    rows = []
+        except Exception as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(2)
 
-    for item in option_data:
-        strike = item.get("strikePrice")
-        expiry = item.get("expiryDate")
-
-        if expiry != nearest_expiry:
-            continue
-
-        ce = item.get("CE", {})
-        pe = item.get("PE", {})
-
-        rows.append({
-            "Strike": strike,
-            "CE OI": ce.get("openInterest", 0),
-            "CE Change OI": ce.get("changeinOpenInterest", 0),
-            "PE OI": pe.get("openInterest", 0),
-            "PE Change OI": pe.get("changeinOpenInterest", 0),
-        })
-
-    df = pd.DataFrame(rows)
-
-    if df.empty:
-        raise RuntimeError(
-            f"No option data available for nearest expiry "
-            f"{nearest_expiry}."
-        )
-
-    numeric_cols = [
-        "Strike",
-        "CE OI",
-        "CE Change OI",
-        "PE OI",
-        "PE Change OI"
-    ]
-
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(
-            df[col],
-            errors="coerce"
-        ).fillna(0)
-
-    return (
-        df.sort_values("Strike").reset_index(drop=True),
-        nearest_expiry,
-        nse_timestamp
+    raise RuntimeError(
+        f"NSE option-chain request failed after 4 attempts: {last_error}"
     )
 
 
@@ -249,11 +239,13 @@ except Exception as e:
 col1, col2 = st.columns([5, 1])
 
 with col1:
-    search_text = st.text_input(
+    selected_symbol = st.selectbox(
         "Search Stock",
-        placeholder="Enter F&O stock symbol e.g. RELIANCE",
-        label_visibility="collapsed"
-    ).strip().upper()
+        options=fno_stocks,
+        index=None,
+        placeholder="Type 1–2 letters and select a stock",
+        key="stock_search"
+    )
 
 with col2:
     refresh = st.button(
@@ -265,31 +257,9 @@ if refresh:
     st.cache_data.clear()
     st.rerun()
 
-if not search_text:
-    st.info(
-        f"Enter an F&O stock symbol to view Open Interest analysis. "
-        f"Universe contains {len(fno_stocks)} F&O stocks."
-    )
+if not selected_symbol:
+    st.info("Type 1–2 letters in the search box and select a stock.")
     st.stop()
-
-if search_text in fno_stocks:
-    selected_symbol = search_text
-else:
-    matches = [x for x in fno_stocks if search_text in x]
-
-    if len(matches) == 1:
-        selected_symbol = matches[0]
-    elif len(matches) > 1:
-        st.warning(
-            "Multiple stocks found. Please enter the exact symbol:"
-        )
-        st.write(", ".join(matches[:30]))
-        st.stop()
-    else:
-        st.error(
-            f"{search_text} is not in the current NSE F&O universe."
-        )
-        st.stop()
 
 
 with st.spinner(
