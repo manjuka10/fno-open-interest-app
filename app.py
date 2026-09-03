@@ -194,7 +194,11 @@ def get_option_chain(symbol, expiry):
                 if last_price is not None:
                     underlying_price = float(last_price)
 
-                if last_price is not None and previous_close:
+                # Prefer NSE's own percentage change when available.
+                nse_pchange = pi.get("pChange")
+                if nse_pchange is not None:
+                    price_change_pct = float(nse_pchange)
+                elif last_price is not None and previous_close:
                     price_change_pct = (
                         (float(last_price) / float(previous_close) - 1) * 100
                     )
@@ -465,12 +469,15 @@ else:
     interpretation = "🟡 Neutral"
 
 st.subheader("🔎 OI Interpretation")
-st.info(
-    f"{interpretation}  •  Price: {price_change_pct:+.2f}%  •  "
-    f"OI: {total_oi_change:+,.0f}"
-    if price_change_pct is not None
-    else f"{interpretation}  •  OI: {total_oi_change:+,.0f}"
-)
+if price_change_pct is not None:
+    st.info(
+        f"{interpretation}  •  Price: {price_change_pct:+.2f}%  •  "
+        f"OI: {total_oi_change:+,.0f}"
+    )
+else:
+    st.warning(
+        f"Price change unavailable from NSE  •  OI: {total_oi_change:+,.0f}"
+    )
 
 st.subheader("📈 Top 3 Highest Open Interest")
 
