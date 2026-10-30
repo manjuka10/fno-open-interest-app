@@ -37,55 +37,101 @@ HEADERS = {
 
 
 def create_nse_session():
+    """
+    Create a browser-like NSE session.
+
+    Note: NSE may still return HTTP 403 when the app is hosted on a
+    cloud/server IP that NSE blocks. No request header can guarantee
+    access in that situation.
+    """
     try:
         session = requests.Session(impersonate="chrome")
-    except TypeError:
+    except (TypeError, AttributeError):
         session = requests.Session()
-    session.headers.update(HEADERS)
-    session.get(NSE_HOME, timeout=15)
-    time.sleep(0.5)
-    session.get(NSE_OPTION_CHAIN_PAGE, timeout=15)
+
+    browser_headers = {
+        **HEADERS,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": NSE_OPTION_CHAIN_PAGE,
+        "Origin": NSE_HOME,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+    }
+    session.headers.update(browser_headers)
+
+    # Warm up the same session so NSE can set its cookies.
+    for url in (NSE_HOME, NSE_OPTION_CHAIN_PAGE):
+        try:
+            session.get(url, timeout=20)
+            time.sleep(1)
+        except Exception:
+            # Continue; the API request below will show the real error.
+            pass
+
     return session
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_fno_stocks():
-    session = create_nse_session()
+    """
+    Load the F&O universe from NSE.
 
-    response = session.get(
-        NSE_UNDERLYING_API,
-        timeout=20
-    )
-    response.raise_for_status()
-    data = response.json()
+    Retry with a fresh session. If NSE blocks the hosting IP with 403,
+    the caller will offer manual symbol entry instead of stopping the app.
+    """
+    last_error = None
 
-    underlying_list = (
-        data.get("data", {})
-            .get("UnderlyingList", [])
-    )
+    for attempt in range(3):
+        try:
+            session = create_nse_session()
+            response = session.get(NSE_UNDERLYING_API, timeout=25)
 
-    stocks = []
+            if response.status_code == 403:
+                raise RuntimeError(
+                    "NSE returned HTTP 403 (Forbidden) for the F&O stock list. "
+                    "This commonly happens when NSE blocks the cloud server IP."
+                )
 
-    for item in underlying_list:
-        symbol = (
-            item.get("symbol")
-            or item.get("SYMBOL")
-            or item.get("underlying")
-            or item.get("UNDERLYING")
-        )
+            response.raise_for_status()
+            data = response.json()
 
-        if symbol:
-            stocks.append(str(symbol).upper().strip())
+            underlying_list = (
+                data.get("data", {}).get("UnderlyingList", [])
+                if isinstance(data, dict) else []
+            )
 
-    stocks = sorted(set(stocks))
+            stocks = []
+            for item in underlying_list:
+                if not isinstance(item, dict):
+                    continue
 
-    if len(stocks) < 100:
-        raise RuntimeError(
-            f"NSE returned only {len(stocks)} F&O stocks. "
-            "Please try Refresh again."
-        )
+                symbol = (
+                    item.get("symbol")
+                    or item.get("SYMBOL")
+                    or item.get("underlying")
+                    or item.get("UNDERLYING")
+                )
+                if symbol:
+                    stocks.append(str(symbol).upper().strip())
 
-    return stocks
+            stocks = sorted(set(stocks))
+
+            if len(stocks) < 100:
+                raise RuntimeError(
+                    f"NSE returned only {len(stocks)} F&O symbols; "
+                    "the response may be incomplete."
+                )
+
+            return stocks
+
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(2 + attempt * 2)
+
+    raise RuntimeError(f"Could not load the NSE F&O stock list: {last_error}")
 
 
 def get_contract_info(session, symbol):
@@ -94,6 +140,14 @@ def get_contract_info(session, symbol):
         params={"symbol": symbol},
         timeout=25
     )
+
+    if response.status_code == 403:
+        raise RuntimeError(
+            "NSE returned HTTP 403 while loading expiry dates. "
+            "The NSE server may be blocking this app's hosting IP. "
+            "Try running the app locally or use an authorized market-data API."
+        )
+
     response.raise_for_status()
     payload = response.json()
     expiry_dates = (
@@ -120,6 +174,14 @@ def get_option_chain(symbol, expiry):
                 },
                 timeout=30
             )
+            if response.status_code == 403:
+                raise RuntimeError(
+                    "NSE returned HTTP 403 for the option-chain request. "
+                    "This is an access restriction from NSE, not an OI calculation issue. "
+                    "If hosted on Streamlit Community Cloud, try local hosting "
+                    "or connect an authorized market-data API."
+                )
+
             response.raise_for_status()
             payload = response.json()
 
@@ -362,23 +424,43 @@ def format_oi_table(df):
     return result
 
 
+# ------------------------------------------------------------
+# F&O STOCK UNIVERSE
+# ------------------------------------------------------------
+# If NSE blocks the app's server IP, do not stop the entire app.
+# Let the user enter a valid NSE F&O symbol manually.
+universe_error = None
 try:
     fno_stocks = get_fno_stocks()
 except Exception as e:
-    st.error(f"Unable to load NSE F&O stock universe: {e}")
-    st.stop()
-
+    fno_stocks = []
+    universe_error = str(e)
 
 col1, col2 = st.columns([5, 1])
 
 with col1:
-    selected_symbol = st.selectbox(
-        "Search Stock",
-        options=fno_stocks,
-        index=None,
-        placeholder="Type 1–2 letters and select a stock",
-        key="stock_search"
-    )
+    if fno_stocks:
+        selected_symbol = st.selectbox(
+            "Search Stock",
+            options=fno_stocks,
+            index=None,
+            placeholder="Type 1–2 letters and select a stock",
+            key="stock_search"
+        )
+    else:
+        st.warning(
+            "NSE F&O stock list is unavailable. "
+            "You can enter a symbol manually below."
+        )
+        if universe_error:
+            st.caption(f"Details: {universe_error}")
+
+        selected_symbol = st.text_input(
+            "Enter NSE F&O symbol (example: RELIANCE, SBIN, INFY)",
+            value="",
+            placeholder="Enter symbol without .NS",
+            key="manual_stock_symbol"
+        ).strip().upper()
 
 with col2:
     refresh = st.button(
@@ -391,9 +473,7 @@ if refresh:
     st.rerun()
 
 if not selected_symbol:
-    st.info(
-        "Type 1–2 letters in the search box and select a stock."
-    )
+    st.info("Select a stock or enter a valid NSE F&O symbol to continue.")
     st.stop()
 
 
@@ -537,7 +617,7 @@ else:
 
 
 def render_small_bar_chart(result_df, value_col):
-    """Render a compact bar chart for the top three strikes."""
+    """Render a compact strike-wise bar chart and show exact values."""
     if result_df.empty:
         st.info("No data available for this section.")
         return
