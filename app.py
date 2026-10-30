@@ -657,9 +657,11 @@ def render_small_bar_chart(result_df, value_col):
     )
 
     labels = alt.Chart(chart_df).mark_text(
-        dy=-9,
-        fontSize=12,
-        fontWeight="bold"
+        dy=-10,
+        color="#FFFFFF",
+        fontSize=14,
+        fontWeight="bold",
+        baseline="bottom"
     ).encode(
         x=alt.X("Strike Label:N", sort=None),
         y=alt.Y("Value:Q", scale=alt.Scale(domain=[0, y_max])),
