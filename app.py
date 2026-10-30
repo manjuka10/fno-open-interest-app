@@ -37,101 +37,55 @@ HEADERS = {
 
 
 def create_nse_session():
-    """
-    Create a browser-like NSE session.
-
-    Note: NSE may still return HTTP 403 when the app is hosted on a
-    cloud/server IP that NSE blocks. No request header can guarantee
-    access in that situation.
-    """
     try:
         session = requests.Session(impersonate="chrome")
-    except (TypeError, AttributeError):
+    except TypeError:
         session = requests.Session()
-
-    browser_headers = {
-        **HEADERS,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": NSE_OPTION_CHAIN_PAGE,
-        "Origin": NSE_HOME,
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-    }
-    session.headers.update(browser_headers)
-
-    # Warm up the same session so NSE can set its cookies.
-    for url in (NSE_HOME, NSE_OPTION_CHAIN_PAGE):
-        try:
-            session.get(url, timeout=20)
-            time.sleep(1)
-        except Exception:
-            # Continue; the API request below will show the real error.
-            pass
-
+    session.headers.update(HEADERS)
+    session.get(NSE_HOME, timeout=15)
+    time.sleep(0.5)
+    session.get(NSE_OPTION_CHAIN_PAGE, timeout=15)
     return session
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_fno_stocks():
-    """
-    Load the F&O universe from NSE.
+    session = create_nse_session()
 
-    Retry with a fresh session. If NSE blocks the hosting IP with 403,
-    the caller will offer manual symbol entry instead of stopping the app.
-    """
-    last_error = None
+    response = session.get(
+        NSE_UNDERLYING_API,
+        timeout=20
+    )
+    response.raise_for_status()
+    data = response.json()
 
-    for attempt in range(3):
-        try:
-            session = create_nse_session()
-            response = session.get(NSE_UNDERLYING_API, timeout=25)
+    underlying_list = (
+        data.get("data", {})
+            .get("UnderlyingList", [])
+    )
 
-            if response.status_code == 403:
-                raise RuntimeError(
-                    "NSE returned HTTP 403 (Forbidden) for the F&O stock list. "
-                    "This commonly happens when NSE blocks the cloud server IP."
-                )
+    stocks = []
 
-            response.raise_for_status()
-            data = response.json()
+    for item in underlying_list:
+        symbol = (
+            item.get("symbol")
+            or item.get("SYMBOL")
+            or item.get("underlying")
+            or item.get("UNDERLYING")
+        )
 
-            underlying_list = (
-                data.get("data", {}).get("UnderlyingList", [])
-                if isinstance(data, dict) else []
-            )
+        if symbol:
+            stocks.append(str(symbol).upper().strip())
 
-            stocks = []
-            for item in underlying_list:
-                if not isinstance(item, dict):
-                    continue
+    stocks = sorted(set(stocks))
 
-                symbol = (
-                    item.get("symbol")
-                    or item.get("SYMBOL")
-                    or item.get("underlying")
-                    or item.get("UNDERLYING")
-                )
-                if symbol:
-                    stocks.append(str(symbol).upper().strip())
+    if len(stocks) < 100:
+        raise RuntimeError(
+            f"NSE returned only {len(stocks)} F&O stocks. "
+            "Please try Refresh again."
+        )
 
-            stocks = sorted(set(stocks))
-
-            if len(stocks) < 100:
-                raise RuntimeError(
-                    f"NSE returned only {len(stocks)} F&O symbols; "
-                    "the response may be incomplete."
-                )
-
-            return stocks
-
-        except Exception as exc:
-            last_error = exc
-            if attempt < 2:
-                time.sleep(2 + attempt * 2)
-
-    raise RuntimeError(f"Could not load the NSE F&O stock list: {last_error}")
+    return stocks
 
 
 def get_contract_info(session, symbol):
@@ -140,14 +94,6 @@ def get_contract_info(session, symbol):
         params={"symbol": symbol},
         timeout=25
     )
-
-    if response.status_code == 403:
-        raise RuntimeError(
-            "NSE returned HTTP 403 while loading expiry dates. "
-            "The NSE server may be blocking this app's hosting IP. "
-            "Try running the app locally or use an authorized market-data API."
-        )
-
     response.raise_for_status()
     payload = response.json()
     expiry_dates = (
@@ -174,14 +120,6 @@ def get_option_chain(symbol, expiry):
                 },
                 timeout=30
             )
-            if response.status_code == 403:
-                raise RuntimeError(
-                    "NSE returned HTTP 403 for the option-chain request. "
-                    "This is an access restriction from NSE, not an OI calculation issue. "
-                    "If hosted on Streamlit Community Cloud, try local hosting "
-                    "or connect an authorized market-data API."
-                )
-
             response.raise_for_status()
             payload = response.json()
 
@@ -424,76 +362,23 @@ def format_oi_table(df):
     return result
 
 
-def render_small_bar_chart(result_df, value_col):
-    """Render a compact strike-wise bar chart with exact values below it."""
-    if result_df.empty:
-        st.info("No data available for this section.")
-        return
-
-    chart_df = result_df[["Strike", value_col]].copy()
-    chart_df["Strike"] = chart_df["Strike"].map(
-        lambda value: f"{float(value):,.0f}"
-    )
-    chart_df[value_col] = pd.to_numeric(
-        chart_df[value_col], errors="coerce"
-    ).fillna(0)
-
-    # Keep the chart compact so CE and PE can be compared side by side.
-    st.bar_chart(
-        chart_df,
-        x="Strike",
-        y=value_col,
-        height=190,
-        use_container_width=True
-    )
-
-    # Show exact figures because native Streamlit bars display values on hover.
-    value_text = "  •  ".join(
-        f"{float(row['Strike']):,.0f}: {float(row[value_col]):+,.0f}"
-        if value_col == "OI Addition"
-        else f"{float(row['Strike']):,.0f}: {float(row[value_col]):,.0f}"
-        for _, row in result_df.iterrows()
-    )
-    st.caption(value_text)
-
-
-# ------------------------------------------------------------
-# F&O STOCK UNIVERSE
-# ------------------------------------------------------------
-# If NSE blocks the app's server IP, do not stop the entire app.
-# Let the user enter a valid NSE F&O symbol manually.
-universe_error = None
 try:
     fno_stocks = get_fno_stocks()
 except Exception as e:
-    fno_stocks = []
-    universe_error = str(e)
+    st.error(f"Unable to load NSE F&O stock universe: {e}")
+    st.stop()
+
 
 col1, col2 = st.columns([5, 1])
 
 with col1:
-    if fno_stocks:
-        selected_symbol = st.selectbox(
-            "Search Stock",
-            options=fno_stocks,
-            index=None,
-            placeholder="Type 1–2 letters and select a stock",
-            key="stock_search"
-        )
-    else:
-        st.warning(
-            "NSE F&O stock list is unavailable. "
-            "You can enter a symbol manually below."
-        )
-        if universe_error:
-            st.caption(f"Details: {universe_error}")
-
-        selected_symbol = st.text_input(
-            "Enter NSE F&O symbol (example: RELIANCE, SBIN, INFY)",
-            value="",
-            placeholder="Enter symbol without .NS",
-            key="manual_stock_symbol"
-        ).strip().upper()
+    selected_symbol = st.selectbox(
+        "Search Stock",
+        options=fno_stocks,
+        index=None,
+        placeholder="Type 1–2 letters and select a stock",
+        key="stock_search"
+    )
 
 with col2:
     refresh = st.button(
@@ -506,7 +391,9 @@ if refresh:
     st.rerun()
 
 if not selected_symbol:
-    st.info("Select a stock or enter a valid NSE F&O symbol to continue.")
+    st.info(
+        "Type 1–2 letters in the search box and select a stock."
+    )
     st.stop()
 
 
@@ -646,6 +533,41 @@ else:
     st.warning(
         "Live price change could not be calculated — previous close unavailable."
     )
+
+
+
+def render_small_bar_chart(result_df, value_col):
+    """Render a compact bar chart for the top three strikes."""
+    if result_df.empty:
+        st.info("No data available for this section.")
+        return
+
+    chart_df = result_df[["Strike", value_col]].copy()
+    chart_df["Strike"] = chart_df["Strike"].map(
+        lambda value: f"{float(value):,.0f}"
+    )
+    chart_df[value_col] = pd.to_numeric(
+        chart_df[value_col], errors="coerce"
+    ).fillna(0)
+
+    st.bar_chart(
+        chart_df,
+        x="Strike",
+        y=value_col,
+        height=190,
+        use_container_width=True
+    )
+
+    exact_values = "  •  ".join(
+        (
+            f"{float(row['Strike']):,.0f}: {float(row[value_col]):+,.0f}"
+            if value_col == "OI Addition"
+            else f"{float(row['Strike']):,.0f}: {float(row[value_col]):,.0f}"
+        )
+        for _, row in result_df.iterrows()
+    )
+    st.caption(exact_values)
+
 
 st.subheader("📈 Top 3 Highest Open Interest")
 
