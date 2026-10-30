@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import altair as alt
 try:
     from curl_cffi import requests
 except ImportError:
@@ -617,36 +618,62 @@ else:
 
 
 def render_small_bar_chart(result_df, value_col):
-    """Render a compact strike-wise bar chart and show exact values."""
+    """Render vertical bars with horizontal strike labels and values above bars."""
     if result_df.empty:
         st.info("No data available for this section.")
         return
 
     chart_df = result_df[["Strike", value_col]].copy()
-    chart_df["Strike"] = chart_df["Strike"].map(
+    chart_df["Strike Label"] = chart_df["Strike"].map(
         lambda value: f"{float(value):,.0f}"
     )
-    chart_df[value_col] = pd.to_numeric(
+    chart_df["Value"] = pd.to_numeric(
         chart_df[value_col], errors="coerce"
     ).fillna(0)
-
-    st.bar_chart(
-        chart_df,
-        x="Strike",
-        y=value_col,
-        height=190,
-        use_container_width=True
+    chart_df["Data Label"] = chart_df["Value"].map(
+        lambda value: f"{value:,.0f}"
     )
 
-    exact_values = "  •  ".join(
-        (
-            f"{float(row['Strike']):,.0f}: {float(row[value_col]):+,.0f}"
-            if value_col == "OI Addition"
-            else f"{float(row['Strike']):,.0f}: {float(row[value_col]):,.0f}"
-        )
-        for _, row in result_df.iterrows()
+    max_value = float(chart_df["Value"].max()) if not chart_df.empty else 0
+    y_max = max_value * 1.22 if max_value > 0 else 1
+
+    bars = alt.Chart(chart_df).mark_bar().encode(
+        x=alt.X(
+            "Strike Label:N",
+            title="Strike",
+            sort=None,
+            axis=alt.Axis(labelAngle=0, labelOverlap=False, labelFontSize=12)
+        ),
+        y=alt.Y(
+            "Value:Q",
+            title=value_col,
+            scale=alt.Scale(domain=[0, y_max]),
+            axis=alt.Axis(format=",.0f")
+        ),
+        tooltip=[
+            alt.Tooltip("Strike Label:N", title="Strike"),
+            alt.Tooltip("Value:Q", title=value_col, format=",.0f")
+        ]
     )
-    st.caption(exact_values)
+
+    labels = alt.Chart(chart_df).mark_text(
+        dy=-9,
+        fontSize=12,
+        fontWeight="bold"
+    ).encode(
+        x=alt.X("Strike Label:N", sort=None),
+        y=alt.Y("Value:Q", scale=alt.Scale(domain=[0, y_max])),
+        text=alt.Text("Data Label:N")
+    )
+
+    chart = (bars + labels).properties(
+        height=230,
+        padding={"top": 18, "right": 8, "bottom": 4, "left": 4}
+    ).configure_view(
+        strokeOpacity=0
+    )
+
+    st.altair_chart(chart, use_container_width=True)
 
 
 st.subheader("📈 Top 3 Highest Open Interest")
