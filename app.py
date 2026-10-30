@@ -424,6 +424,39 @@ def format_oi_table(df):
     return result
 
 
+def render_small_bar_chart(result_df, value_col):
+    """Render a compact strike-wise bar chart with exact values below it."""
+    if result_df.empty:
+        st.info("No data available for this section.")
+        return
+
+    chart_df = result_df[["Strike", value_col]].copy()
+    chart_df["Strike"] = chart_df["Strike"].map(
+        lambda value: f"{float(value):,.0f}"
+    )
+    chart_df[value_col] = pd.to_numeric(
+        chart_df[value_col], errors="coerce"
+    ).fillna(0)
+
+    # Keep the chart compact so CE and PE can be compared side by side.
+    st.bar_chart(
+        chart_df,
+        x="Strike",
+        y=value_col,
+        height=190,
+        use_container_width=True
+    )
+
+    # Show exact figures because native Streamlit bars display values on hover.
+    value_text = "  •  ".join(
+        f"{float(row['Strike']):,.0f}: {float(row[value_col]):+,.0f}"
+        if value_col == "OI Addition"
+        else f"{float(row['Strike']):,.0f}: {float(row[value_col]):,.0f}"
+        for _, row in result_df.iterrows()
+    )
+    st.caption(value_text)
+
+
 # ------------------------------------------------------------
 # F&O STOCK UNIVERSE
 # ------------------------------------------------------------
@@ -623,19 +656,11 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.markdown("#### CE")
-    st.dataframe(
-        format_oi_table(ce_oi),
-        use_container_width=True,
-        hide_index=True
-    )
+    render_small_bar_chart(ce_oi, "Open Interest")
 
 with col2:
     st.markdown("#### PE")
-    st.dataframe(
-        format_oi_table(pe_oi),
-        use_container_width=True,
-        hide_index=True
-    )
+    render_small_bar_chart(pe_oi, "Open Interest")
 
 st.subheader("🟢 Top 3 Highest OI Addition")
 
@@ -646,19 +671,11 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.markdown("#### CE")
-    st.dataframe(
-        format_oi_table(ce_add),
-        use_container_width=True,
-        hide_index=True
-    )
+    render_small_bar_chart(ce_add, "OI Addition")
 
 with col2:
     st.markdown("#### PE")
-    st.dataframe(
-        format_oi_table(pe_add),
-        use_container_width=True,
-        hide_index=True
-    )
+    render_small_bar_chart(pe_add, "OI Addition")
 
 st.subheader("🔴 Top 3 Highest OI Unwinding")
 
@@ -669,19 +686,11 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.markdown("#### CE")
-    st.dataframe(
-        format_oi_table(ce_unwind),
-        use_container_width=True,
-        hide_index=True
-    )
+    render_small_bar_chart(ce_unwind, "OI Unwinding")
 
 with col2:
     st.markdown("#### PE")
-    st.dataframe(
-        format_oi_table(pe_unwind),
-        use_container_width=True,
-        hide_index=True
-    )
+    render_small_bar_chart(pe_unwind, "OI Unwinding")
 
 st.caption(
     "Data source: NSE India • OI values are in contracts • "
