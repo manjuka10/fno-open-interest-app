@@ -687,6 +687,8 @@ def render_small_bar_chart(result_df, value_col):
         padding={"top": 18, "right": 8, "bottom": 4, "left": 4}
     ).configure_view(
         strokeOpacity=0
+    ).configure_axis(
+        grid=False
     )
 
     st.altair_chart(chart, use_container_width=True)
