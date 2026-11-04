@@ -37,6 +37,7 @@ HEADERS = {
 }
 
 
+
 def create_nse_session():
     """
     Create a browser-like NSE session.
@@ -135,7 +136,9 @@ def get_fno_stocks():
     raise RuntimeError(f"Could not load the NSE F&O stock list: {last_error}")
 
 
-def get_contract_info(session, symbol):
+@st.cache_data(ttl=900, show_spinner=False)
+def get_contract_info(symbol):
+    session = create_nse_session()
     response = session.get(
         NSE_CONTRACT_INFO_API,
         params={"symbol": symbol},
@@ -160,6 +163,7 @@ def get_contract_info(session, symbol):
     return expiry_dates
 
 
+@st.cache_data(ttl=90, show_spinner=False)
 def get_option_chain(symbol, expiry):
     last_error = None
 
@@ -434,34 +438,23 @@ universe_error = None
 try:
     fno_stocks = get_fno_stocks()
 except Exception as e:
-    fno_stocks = []
-    universe_error = str(e)
+    st.error(f"Unable to fetch NSE F&O universe: {e}")
+    st.info(
+        "Stock suggestions are sourced exclusively from NSE's live F&O universe. "
+        "No manual or hard-coded stock list is used. Please retry when NSE is accessible."
+    )
+    st.stop()
 
 col1, col2 = st.columns([5, 1])
 
 with col1:
-    if fno_stocks:
-        selected_symbol = st.selectbox(
-            "Search Stock",
-            options=fno_stocks,
-            index=None,
-            placeholder="Type 1–2 letters and select a stock",
-            key="stock_search"
-        )
-    else:
-        st.warning(
-            "NSE F&O stock list is unavailable. "
-            "You can enter a symbol manually below."
-        )
-        if universe_error:
-            st.caption(f"Details: {universe_error}")
-
-        selected_symbol = st.text_input(
-            "Enter NSE F&O symbol (example: RELIANCE, SBIN, INFY)",
-            value="",
-            placeholder="Enter symbol without .NS",
-            key="manual_stock_symbol"
-        ).strip().upper()
+    selected_symbol = st.selectbox(
+        "Search Stock",
+        options=fno_stocks,
+        index=None,
+        placeholder="Type 1–2 letters and select a stock",
+        key="stock_search"
+    )
 
 with col2:
     refresh = st.button(
@@ -474,7 +467,7 @@ if refresh:
     st.rerun()
 
 if not selected_symbol:
-    st.info("Select a stock or enter a valid NSE F&O symbol to continue.")
+    st.info("Select a stock from NSE’s live F&O universe to continue.")
     st.stop()
 
 
@@ -483,13 +476,21 @@ if not selected_symbol:
 # ============================================================
 
 try:
-    expiry_dates = get_contract_info(
-        create_nse_session(),
-        selected_symbol
-    )
+    expiry_dates = get_contract_info(selected_symbol)
+    st.session_state[f"last_expiries_{selected_symbol}"] = expiry_dates
+    expiry_is_cached = False
 except Exception as e:
-    st.error(f"Unable to load expiry dates: {e}")
-    st.stop()
+    expiry_dates = st.session_state.get(f"last_expiries_{selected_symbol}")
+    if expiry_dates:
+        expiry_is_cached = True
+        st.warning("NSE expiry request failed. Showing expiry dates saved earlier in this session.")
+        st.caption(str(e))
+    else:
+        st.error(f"Unable to load expiry dates: {e}")
+        st.stop()
+
+if expiry_is_cached:
+    st.caption("⚠️ Expiry list may be outdated; NSE could not refresh it.")
 
 expiry = st.selectbox(
     "Expiry",
@@ -503,21 +504,34 @@ with st.spinner(
     f"{selected_symbol} ({expiry})..."
 ):
     try:
-        (
-            df,
-            expiry,
-            nse_timestamp,
-            underlying_price,
-            previous_close,
-            price_change_pct
-        ) = get_option_chain(selected_symbol, expiry)
+        chain_result = get_option_chain(selected_symbol, expiry)
+        st.session_state[f"last_chain_{selected_symbol}_{expiry}"] = chain_result
+        chain_is_cached = False
     except Exception as e:
-        st.error(f"Unable to fetch NSE option-chain data: {e}")
-        st.info(
-            "The app automatically retries NSE requests. "
-            "If NSE is temporarily unavailable, press Refresh."
-        )
-        st.stop()
+        chain_result = st.session_state.get(f"last_chain_{selected_symbol}_{expiry}")
+        if chain_result is not None:
+            chain_is_cached = True
+            st.warning("NSE refresh failed. Showing the last successful option-chain data saved in this session.")
+            st.caption(str(e))
+        else:
+            st.error(f"Unable to fetch NSE option-chain data: {e}")
+            st.info(
+                "NSE may be blocking this server IP. Cached data is available only "
+                "after at least one successful fetch in this browser session."
+            )
+            st.stop()
+
+    (
+        df,
+        expiry,
+        nse_timestamp,
+        underlying_price,
+        previous_close,
+        price_change_pct
+    ) = chain_result
+
+if chain_is_cached:
+    st.warning("⚠️ This option-chain snapshot is cached and may be stale. Check its timestamp before trading.")
 
 
 if nse_timestamp:
